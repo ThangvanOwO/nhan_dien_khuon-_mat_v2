@@ -1,0 +1,5 @@
+{% extends "admin/base.html" %}{% load static %}
+{% block title %}{{ title }} · VISTA Admin{% endblock %}
+{% block branding %}<h1 id="site-name"><a href="{% url 'admin:index' %}">VISTA <span style="font-size:12px;opacity:.65">/ Quản trị dữ liệu</span></a></h1>{% endblock %}
+{% block extrahead %}{{ block.super }}<link rel="icon" href="{% static 'favicon.svg' %}"><link rel="stylesheet" href="{% static 'css/admin.css' %}">{% endblock %}
+{% block nav-global %}<a class="vista-back" href="/">← Về workspace</a>{% endblock %}

@@ -1,865 +1,514 @@
-from django.shortcuts import render, redirect, get_object_or_404
-from django.http import JsonResponse, StreamingHttpResponse
-from django.views.decorators.http import require_http_methods
-from django.views.decorators.csrf import csrf_exempt
-from django.conf import settings
-from django.utils import timezone
-from django.db.models import Count, Avg
-from .models import Student, AttendanceRecord, Camera, SystemStats, Subject, ClassRoom, Schedule, AttendanceSession
-from . import face_recognition as fr
-import json
+import base64
+import csv
+import datetime
+import functools
+import io
+import logging
+import re
+import shutil
+
 import cv2
 import numpy as np
-import base64
-import os
-import datetime
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
+from django.db import IntegrityError, transaction
+from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
+from django.views.decorators.http import require_http_methods
+
+from . import face_recognition as fr
+from .attendance import record_student, student_for_identity, validate_confidence
+from .models import (AttendanceRecord, AttendanceSession, Camera, ClassRoom,
+                     Schedule, Student, Subject)
+
+logger = logging.getLogger(__name__)
+
+
+def api(methods):
+    def decorate(function):
+        @require_http_methods(methods)
+        @functools.wraps(function)
+        def wrapped(request, *args, **kwargs):
+            try:
+                return function(request, *args, **kwargs)
+            except (ValueError, TypeError, ValidationError) as error:
+                return JsonResponse({'success': False, 'error': str(error)}, status=400)
+            except (Student.DoesNotExist, Schedule.DoesNotExist, AttendanceSession.DoesNotExist,
+                    Subject.DoesNotExist, ClassRoom.DoesNotExist):
+                return JsonResponse({'success': False, 'error': 'Không tìm thấy dữ liệu yêu cầu.'}, status=404)
+            except IntegrityError:
+                return JsonResponse({'success': False, 'error': 'Mã đã tồn tại hoặc dữ liệu đang được sử dụng.'}, status=409)
+            except Exception:
+                logger.exception('API failure: %s', request.path)
+                return JsonResponse({'success': False, 'error': 'Không thể xử lý yêu cầu. Vui lòng thử lại.'}, status=500)
+        return wrapped
+    return decorate
+
+
+def payload(request):
+    import json
+    try:
+        data = json.loads(request.body)
+    except (ValueError, UnicodeDecodeError):
+        raise ValueError('Nội dung JSON không hợp lệ.')
+    if not isinstance(data, dict):
+        raise ValueError('Yêu cầu phải là một đối tượng JSON.')
+    return data
+
+
+def decode_image(value):
+    if not isinstance(value, str) or len(value) > 12_000_000:
+        raise ValueError('Ảnh không hợp lệ hoặc vượt giới hạn 8 MB.')
+    try:
+        raw = base64.b64decode(value.split(',', 1)[-1], validate=True)
+        if len(raw) > 8_000_000 or not raw:
+            raise ValueError()
+        frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    except Exception:
+        raise ValueError('Không đọc được ảnh. Vui lòng chọn ảnh JPG hoặc PNG.')
+    if frame is None or frame.shape[0] * frame.shape[1] > 25_000_000:
+        raise ValueError('Ảnh không hợp lệ hoặc quá lớn.')
+    if max(frame.shape[:2]) > 1600:
+        ratio = 1600 / max(frame.shape[:2])
+        frame = cv2.resize(frame, (0, 0), fx=ratio, fy=ratio)
+    return frame
+
+
+def student_fields(data, student=None):
+    code = str(data.get('student_id', student.student_id if student else '')).strip()
+    name = str(data.get('full_name', data.get('name', student.full_name if student else ''))).strip()
+    class_name = str(data.get('class_name', student.class_name if student else '')).strip()
+    email = str(data.get('email', student.email if student else '')).strip()
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,20}', code):
+        raise ValueError('Mã sinh viên dài tối đa 20 ký tự, chỉ gồm chữ, số, gạch ngang và gạch dưới.')
+    fr.person_directory(code)
+    if not name or len(name) > 100 or len(class_name) > 50:
+        raise ValueError('Vui lòng nhập họ tên hợp lệ (tối đa 100 ký tự).')
+    if email:
+        validate_email(email)
+    duplicate = Student.objects.filter(student_id=code)
+    if student:
+        duplicate = duplicate.exclude(pk=student.pk)
+    if duplicate.exists():
+        raise ValueError('Mã sinh viên đã tồn tại.')
+    return {'student_id': code, 'full_name': name, 'class_name': class_name, 'email': email}
+
+
+def student_json(student):
+    return {'id': student.pk, 'student_id': student.student_id, 'full_name': student.full_name,
+            'class_name': student.class_name, 'email': student.email, 'is_registered': student.is_registered}
+
+
+def sync_class(student):
+    # class_name is the selected primary class. Keep membership aligned after edits.
+    student.classrooms.clear()
+    if student.class_name:
+        classroom, _ = ClassRoom.objects.get_or_create(
+            class_id=student.class_name, defaults={'name': student.class_name})
+        classroom.students.add(student)
+
+
+def stats():
+    today = timezone.localdate()
+    total = Student.objects.count()
+    records = AttendanceRecord.objects.filter(date=today)
+    present = records.filter(status__in=['present', 'late']).values('student_id').distinct().count()
+    registered = Student.objects.filter(is_registered=True).count()
+    return {'total_students': total, 'registered_students': registered,
+            'today_present': present, 'today_absent': max(0, total - present),
+            'attendance_rate': round(present * 100 / total, 1) if total else 0,
+            'active_cameras': Camera.objects.filter(status='active').count(),
+            'today_sessions': AttendanceSession.objects.filter(date=today).count(),
+            'active_sessions': AttendanceSession.objects.filter(status='active', date=today).count(),
+            'avg_scan_time': round(fr.last_scan_ms / 1000, 3) if fr.last_scan_ms is not None else None,
+            'last_sync': timezone.localtime().strftime('%H:%M:%S')}
+
+
+def page(request, template, active, **context):
+    context.update({'active_nav': active, 'today': timezone.localdate(), 'stats': stats()})
+    return render(request, template, context)
 
 
 def home(request):
-    """Trang chủ - Portal chính"""
-    # Lấy thống kê
-    total_students = Student.objects.count()
-    
-    # Tính tỷ lệ điểm danh hôm nay
-    today = timezone.now().date()
-    today_attendance = AttendanceRecord.objects.filter(
-        date=today, 
-        status__in=['present', 'late']
-    ).count()
-    
-    if total_students > 0:
-        attendance_rate = round((today_attendance / total_students) * 100, 1)
-    else:
-        attendance_rate = 0
-    
-    # Số camera đang hoạt động
-    active_cameras = Camera.objects.filter(status='active').count()
-    
-    context = {
-        'total_students': total_students or 1248,  # Default value nếu chưa có data
-        'attendance_rate': attendance_rate or 96.4,
-        'active_cameras': active_cameras or 8,
-        'avg_scan_time': 0.8,
-        'opencv_plugin_url': settings.OPENCV_PLUGIN_URL,
-        'admin_url': settings.ADMIN_DASHBOARD_URL,
-        'register_url': settings.REGISTER_FACE_URL,
-    }
-    return render(request, 'portal/home.html', context)
+    return page(request, 'portal/home.html', 'home',
+                recent_records=AttendanceRecord.objects.select_related('student', 'session')[:6],
+                today_schedules=Schedule.objects.filter(is_active=True, day_of_week=timezone.localdate().weekday())
+                .select_related('subject', 'classroom')[:4])
 
 
 def admin_dashboard(request):
-    """Trang Admin Dashboard"""
-    from .face_recognition import load_database
-    
-    # Đếm số người đã đăng ký khuôn mặt từ face_database.pkl
-    face_db = load_database()
-    registered_faces = len(face_db)  # Số người đã đăng ký mặt
-    
-    # Thống kê tổng quan từ Student model
-    total_students = Student.objects.count()
-    
-    today = timezone.now().date()
-    today_records = AttendanceRecord.objects.filter(date=today)
-    
-    # Đếm số sinh viên unique có mặt hôm nay (không đếm trùng)
-    today_present_unique = today_records.filter(status='present').values('student').distinct().count()
-    
-    # Vắng = Tổng sinh viên - Có mặt unique (không được âm)
-    today_absent = max(0, total_students - today_present_unique)
-    
-    context = {
-        'total_students': total_students,
-        'registered_students': registered_faces,  # Từ face_database.pkl
-        'today_present': today_present_unique,  # Số sinh viên unique
-        'today_late': today_records.filter(status='late').values('student').distinct().count(),
-        'today_absent': today_absent,
-        'recent_records': AttendanceRecord.objects.select_related('student').order_by('-date', '-time_in')[:20],
-        'cameras': Camera.objects.all(),
-        'students': Student.objects.all().order_by('-created_at'),  # Danh sách sinh viên
-    }
-    return render(request, 'portal/admin_dashboard.html', context)
+    return page(request, 'portal/admin_dashboard.html', 'admin', students=Student.objects.all(),
+                recent_records=AttendanceRecord.objects.select_related('student', 'session')[:200],
+                cameras=Camera.objects.all())
 
 
 def register_face(request):
-    """Trang đăng ký khuôn mặt mới"""
-    context = {
-        'opencv_plugin_url': settings.OPENCV_PLUGIN_URL,
-    }
-    return render(request, 'portal/register.html', context)
+    return page(request, 'portal/register.html', 'register', classrooms=ClassRoom.objects.all())
 
 
 def scan_camera(request):
-    """
-    Trang scan camera với nhận diện khuôn mặt real-time
-    """
-    students = Student.objects.filter(is_registered=True)
-    context = {
-        'students': students,
-        'message': 'Điểm danh bằng nhận diện khuôn mặt'
-    }
-    return render(request, 'portal/scan_camera.html', context)
+    return page(request, 'portal/scan_camera.html', 'scan', students=Student.objects.filter(is_registered=True))
 
 
-# =====================================================
-# Thời khóa biểu và Điểm danh theo buổi
-# =====================================================
+def technology(request):
+    return page(request, 'portal/technology.html', 'technology')
+
 
 def schedule_view(request):
-    """Trang thời khóa biểu - Chọn buổi học để điểm danh"""
-    today = timezone.now().date()
-    current_day = today.weekday()  # 0 = Monday
-    
-    # Lấy tất cả thời khóa biểu
     schedules = Schedule.objects.filter(is_active=True).select_related('subject', 'classroom')
-    
-    # Tạo dữ liệu thời khóa biểu theo ngày
-    schedule_by_day = {}
-    for day_num, day_name in Schedule.DAY_CHOICES:
-        schedule_by_day[day_num] = {
-            'name': day_name,
-            'schedules': schedules.filter(day_of_week=day_num)
-        }
-    
-    # Lấy các buổi điểm danh hôm nay
-    today_sessions = AttendanceSession.objects.filter(date=today).select_related('schedule__subject', 'schedule__classroom')
-    
-    # Lấy các buổi đang hoạt động
-    active_sessions = AttendanceSession.objects.filter(status='active').select_related('schedule__subject', 'schedule__classroom')
-    
-    context = {
-        'schedule_by_day': schedule_by_day,
-        'today': today,
-        'current_day': current_day,
-        'today_sessions': today_sessions,
-        'active_sessions': active_sessions,
-        'subjects': Subject.objects.all(),
-        'classrooms': ClassRoom.objects.all(),
-    }
-    return render(request, 'portal/schedule.html', context)
+    today = timezone.localdate()
+    return page(request, 'portal/schedule.html', 'schedule',
+                schedule_by_day={day: {'name': name, 'schedules': schedules.filter(day_of_week=day)}
+                                 for day, name in Schedule.DAY_CHOICES},
+                current_day=today.weekday(), subjects=Subject.objects.all(), classrooms=ClassRoom.objects.all(),
+                today_sessions=AttendanceSession.objects.filter(date=today).select_related('schedule__subject', 'schedule__classroom'),
+                active_sessions=AttendanceSession.objects.filter(date=today, status='active').select_related('schedule__subject', 'schedule__classroom'))
 
 
-def start_attendance_session(request, schedule_id):
-    """Bắt đầu buổi điểm danh từ thời khóa biểu"""
-    schedule = get_object_or_404(Schedule, id=schedule_id)
-    today = timezone.now().date()
-    
-    # Tạo hoặc lấy buổi điểm danh cho hôm nay
+def activate_session(schedule, date):
+    if date != timezone.localdate():
+        raise ValueError('Chỉ mở điểm danh cho ngày hôm nay.')
+    if schedule.day_of_week != date.weekday():
+        raise ValueError('Lịch học này không diễn ra vào hôm nay.')
+    if not schedule.is_active:
+        raise ValueError('Lịch học này đã ngừng hoạt động.')
     session, created = AttendanceSession.objects.get_or_create(
-        schedule=schedule,
-        date=today,
-        defaults={
-            'status': 'active',
-            'start_time': timezone.now()
-        }
-    )
-    
+        schedule=schedule, date=date, defaults={'status': 'active', 'start_time': timezone.now()})
     if not created:
-        # Nếu đã tồn tại, chuyển sang trạng thái active
-        session.status = 'active'
-        session.start_time = timezone.now()
-        session.save()
-    
-    return redirect('portal:attendance_session', session_id=session.id)
-
-
-def attendance_session(request, session_id):
-    """Trang điểm danh cho 1 buổi học cụ thể"""
-    session = get_object_or_404(AttendanceSession, id=session_id)
-    
-    # Lấy danh sách sinh viên trong lớp
-    students_in_class = session.schedule.classroom.students.all()
-    
-    # Lấy các bản ghi điểm danh của buổi này
-    attendance_records = session.session_records.select_related('student')
-    attended_ids = attendance_records.values_list('student_id', flat=True)
-    
-    context = {
-        'session': session,
-        'students_in_class': students_in_class,
-        'attendance_records': attendance_records,
-        'attended_count': attendance_records.filter(status='present').count(),
-        'total_students': students_in_class.count(),
-    }
-    return render(request, 'portal/attendance_session.html', context)
-
-
-def end_attendance_session(request, session_id):
-    """Kết thúc buổi điểm danh"""
-    session = get_object_or_404(AttendanceSession, id=session_id)
-    session.status = 'completed'
-    session.end_time = timezone.now()
-    session.save()
-    return redirect('portal:schedule')
-
-
-# =====================================================
-# Video Streaming với Face Recognition
-# =====================================================
-
-# Lưu session_id hiện tại đang điểm danh (global variable)
-_current_session_id = None
-
-def set_current_session(session_id):
-    global _current_session_id
-    _current_session_id = session_id
-
-def get_current_session():
-    global _current_session_id
-    return _current_session_id
-
-
-def gen_frames(camera):
-    """Generator để stream video frames với nhận diện khuôn mặt"""
-    while True:
-        frame = camera.get_frame()
-        if frame is not None:
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-
-def video_feed(request):
-    """Stream video với nhận diện khuôn mặt"""
-    session_id = request.GET.get('session_id')
-    if session_id:
-        set_current_session(int(session_id))
-    camera = fr.VideoCamera()
-    return StreamingHttpResponse(
-        gen_frames(camera),
-        content_type='multipart/x-mixed-replace; boundary=frame'
-    )
-
-
-def video_feed_session(request, session_id):
-    """Stream video cho buổi điểm danh cụ thể"""
-    set_current_session(session_id)
-    camera = fr.VideoCamera(session_id=session_id)
-    return StreamingHttpResponse(
-        gen_frames(camera),
-        content_type='multipart/x-mixed-replace; boundary=frame'
-    )
-
-
-# =====================================================
-# API Endpoints
-# =====================================================
-
-@require_http_methods(["GET"])
-def api_stats(request):
-    """API trả về thống kê realtime"""
-    total_students = Student.objects.count() or 1248
-    today = timezone.now().date()
-    today_attendance = AttendanceRecord.objects.filter(
-        date=today,
-        status__in=['present', 'late']
-    ).count()
-    
-    if total_students > 0:
-        attendance_rate = round((today_attendance / total_students) * 100, 1)
-    else:
-        attendance_rate = 96.4
-    
-    active_cameras = Camera.objects.filter(status='active').count() or 8
-    
-    return JsonResponse({
-        'success': True,
-        'data': {
-            'total_students': total_students,
-            'attendance_rate': attendance_rate,
-            'active_cameras': active_cameras,
-            'avg_scan_time': 0.8,
-            'last_sync': timezone.now().strftime('%H:%M:%S'),
-        }
-    })
-
-
-@require_http_methods(["POST"])
-def api_record_attendance(request):
-    """
-    API để plugin OpenCV gọi khi nhận diện được khuôn mặt
-    
-    Expected POST data:
-    {
-        "student_id": "SV001",
-        "confidence": 98.5,
-        "camera_id": "CAM01"
-    }
-    """
-    try:
-        data = json.loads(request.body)
-        student_id = data.get('student_id')
-        confidence = data.get('confidence', 0)
-        camera_id = data.get('camera_id', '')
-        
-        # Tìm sinh viên
-        try:
-            student = Student.objects.get(student_id=student_id)
-        except Student.DoesNotExist:
-            return JsonResponse({
-                'success': False,
-                'error': 'Student not found'
-            }, status=404)
-        
-        # Tạo bản ghi điểm danh
-        today = timezone.now().date()
-        current_time = timezone.now().time()
-        
-        record, created = AttendanceRecord.objects.get_or_create(
-            student=student,
-            date=today,
-            defaults={
-                'time_in': current_time,
-                'status': 'present',
-                'confidence': confidence,
-                'camera_id': camera_id,
-            }
-        )
-        
-        if not created:
-            # Đã điểm danh rồi, cập nhật time_out
-            record.time_out = current_time
-            record.save()
-        
-        return JsonResponse({
-            'success': True,
-            'message': 'Attendance recorded',
-            'data': {
-                'student_name': student.full_name,
-                'student_id': student.student_id,
-                'time': current_time.strftime('%H:%M:%S'),
-                'status': record.status,
-                'created': created
-            }
-        })
-        
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
-
-
-@require_http_methods(["GET"])
-def api_students(request):
-    """API lấy danh sách sinh viên"""
-    students = Student.objects.all().values(
-        'student_id', 'full_name', 'class_name', 'is_registered'
-    )
-    return JsonResponse({
-        'success': True,
-        'data': list(students)
-    })
-
-
-@require_http_methods(["GET"])
-def api_attendance_today(request):
-    """API lấy danh sách điểm danh hôm nay"""
-    today = timezone.now().date()
-    records = AttendanceRecord.objects.filter(date=today).select_related('student')
-    
-    data = [{
-        'student_id': r.student.student_id,
-        'student_name': r.student.full_name,
-        'time_in': r.time_in.strftime('%H:%M:%S') if r.time_in else None,
-        'status': r.status,
-        'confidence': r.confidence,
-    } for r in records]
-    
-    return JsonResponse({
-        'success': True,
-        'date': str(today),
-        'data': data
-    })
-
-
-# =====================================================
-# Face Recognition APIs
-# =====================================================
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_register_face(request):
-    """API đăng ký khuôn mặt từ ảnh base64"""
-    try:
-        data = json.loads(request.body)
-        student_id = data.get('student_id')
-        name = data.get('name')
-        class_name = data.get('class_name', '')  # Lấy class_name
-        email = data.get('email', '')  # Lấy email
-        images_base64 = data.get('images', [])  # List of base64 images
-        
-        if not student_id or not name or not images_base64:
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing student_id, name, or images'
-            }, status=400)
-        
-        # Decode và xử lý ảnh
-        registered_count = 0
-        for img_b64 in images_base64:
-            try:
-                # Xóa header base64 nếu có
-                if ',' in img_b64:
-                    img_b64 = img_b64.split(',')[1]
-                
-                img_data = base64.b64decode(img_b64)
-                nparr = np.frombuffer(img_data, np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if frame is not None:
-                    success = fr.register_face(name, frame)
-                    if success:
-                        registered_count += 1
-            except Exception as e:
-                print(f"Error processing image: {e}")
-                continue
-        
-        if registered_count > 0:
-            # Cập nhật student trong database với đầy đủ thông tin
-            student, created = Student.objects.update_or_create(
-                student_id=student_id,
-                defaults={
-                    'full_name': name,
-                    'class_name': class_name,  # Lưu class_name
-                    'email': email,  # Lưu email
-                    'is_registered': True
-                }
-            )
-            
-            # Tự động thêm sinh viên vào ClassRoom nếu có class_name
-            if class_name:
-                from .models import ClassRoom
-                try:
-                    classroom = ClassRoom.objects.get(class_id=class_name)
-                    classroom.students.add(student)
-                except ClassRoom.DoesNotExist:
-                    pass  # Lớp không tồn tại thì bỏ qua
-            
-            return JsonResponse({
-                'success': True,
-                'message': f'Registered {registered_count} face(s) for {name}',
-                'data': {
-                    'student_id': student_id,
-                    'name': name,
-                    'faces_registered': registered_count
-                }
-            })
-        else:
-            return JsonResponse({
-                'success': False,
-                'error': 'No faces detected in provided images'
-            }, status=400)
-            
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
-
-
-@csrf_exempt
-@require_http_methods(["DELETE"])
-def api_delete_student(request, student_id):
-    """API xóa sinh viên và dữ liệu khuôn mặt"""
-    import shutil
-    from .face_recognition import load_database, save_database, MY_FACES_DIR
-    
-    try:
-        # Lấy thông tin sinh viên
-        student = Student.objects.get(id=student_id)
-        student_name = student.full_name
-        
-        # 1. Xóa khỏi face_database.pkl
-        face_db = load_database()
-        if student_name in face_db:
-            del face_db[student_name]
-            save_database(face_db)
-        
-        # 2. Xóa thư mục ảnh my_faces/{tên}
-        import os
-        person_dir = os.path.join(MY_FACES_DIR, student_name)
-        if os.path.exists(person_dir):
-            shutil.rmtree(person_dir)
-        
-        # 3. Xóa các bản ghi điểm danh liên quan
-        AttendanceRecord.objects.filter(student=student).delete()
-        
-        # 4. Xóa sinh viên khỏi database
-        student.delete()
-        
-        return JsonResponse({
-            'success': True,
-            'message': f'Đã xóa sinh viên {student_name} và tất cả dữ liệu liên quan'
-        })
-        
-    except Student.DoesNotExist:
-        return JsonResponse({
-            'success': False,
-            'error': 'Không tìm thấy sinh viên'
-        }, status=404)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
-
-
-@csrf_exempt
-@require_http_methods(["PUT"])
-def api_update_student(request, student_id):
-    """API cập nhật thông tin sinh viên"""
-    from .face_recognition import load_database, save_database, MY_FACES_DIR
-    import os
-    import shutil
-    
-    try:
-        data = json.loads(request.body)
-        student = Student.objects.get(id=student_id)
-        old_name = student.full_name
-        
-        # Cập nhật thông tin
-        new_student_id = data.get('student_id', student.student_id)
-        new_full_name = data.get('full_name', student.full_name)
-        new_class_name = data.get('class_name', student.class_name)
-        new_email = data.get('email', student.email)
-        
-        # Nếu tên thay đổi, cập nhật trong face_database.pkl và thư mục my_faces
-        if new_full_name != old_name:
-            # Cập nhật face_database.pkl
-            face_db = load_database()
-            if old_name in face_db:
-                face_db[new_full_name] = face_db.pop(old_name)
-                save_database(face_db)
-            
-            # Đổi tên thư mục my_faces
-            old_dir = os.path.join(MY_FACES_DIR, old_name)
-            new_dir = os.path.join(MY_FACES_DIR, new_full_name)
-            if os.path.exists(old_dir):
-                shutil.move(old_dir, new_dir)
-                # Đổi tên các file ảnh trong thư mục
-                for i, filename in enumerate(os.listdir(new_dir), 1):
-                    old_path = os.path.join(new_dir, filename)
-                    ext = os.path.splitext(filename)[1]
-                    new_path = os.path.join(new_dir, f"{new_full_name}_{i}{ext}")
-                    if old_path != new_path:
-                        os.rename(old_path, new_path)
-        
-        # Cập nhật student trong database
-        student.student_id = new_student_id
-        student.full_name = new_full_name
-        student.class_name = new_class_name
-        student.email = new_email
-        student.save()
-        
-        return JsonResponse({
-            'success': True,
-            'message': f'Đã cập nhật thông tin sinh viên {new_full_name}'
-        })
-        
-    except Student.DoesNotExist:
-        return JsonResponse({
-            'success': False,
-            'error': 'Không tìm thấy sinh viên'
-        }, status=404)
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_recognize_face(request):
-    """API nhận diện khuôn mặt từ ảnh base64"""
-    try:
-        data = json.loads(request.body)
-        image_base64 = data.get('image')
-        
-        if not image_base64:
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing image'
-            }, status=400)
-        
-        # Xóa header base64 nếu có
-        if ',' in image_base64:
-            image_base64 = image_base64.split(',')[1]
-        
-        img_data = base64.b64decode(image_base64)
-        nparr = np.frombuffer(img_data, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if frame is None:
-            return JsonResponse({
-                'success': False,
-                'error': 'Invalid image data'
-            }, status=400)
-        
-        # Nhận diện khuôn mặt
-        results = fr.recognize_frame(frame)
-        
-        recognized = []
-        for name, score, bbox in results:
-            if name != "Unknown":
-                recognized.append({
-                    'name': name,
-                    'confidence': round(score * 100, 1),
-                    'bbox': bbox.tolist() if hasattr(bbox, 'tolist') else bbox
-                })
-                
-                # Tự động ghi nhận điểm danh
-                try:
-                    student = Student.objects.get(full_name=name)
-                    current_time = timezone.now()
-                    AttendanceRecord.objects.update_or_create(
-                        student=student,
-                        date=current_time.date(),
-                        defaults={
-                            'time_in': current_time,
-                            'status': 'present',
-                            'confidence': score
-                        }
-                    )
-                except Student.DoesNotExist:
-                    pass
-        
-        return JsonResponse({
-            'success': True,
-            'data': {
-                'faces_detected': len(results),
-                'recognized': recognized
-            }
-        })
-        
-    except json.JSONDecodeError:
-        return JsonResponse({
-            'success': False,
-            'error': 'Invalid JSON'
-        }, status=400)
-    except Exception as e:
-        return JsonResponse({
-            'success': False,
-            'error': str(e)
-        }, status=500)
-
-
-@require_http_methods(["GET"])
-def api_registered_faces(request):
-    """API lấy danh sách khuôn mặt đã đăng ký"""
-    database = fr.load_database()
-    
-    faces = []
-    for name, embeddings in database.items():
-        faces.append({
-            'name': name,
-            'embeddings_count': len(embeddings)
-        })
-    
-    return JsonResponse({
-        'success': True,
-        'data': faces
-    })
-
-
-# =====================================================
-# API cho Thời khóa biểu và Buổi điểm danh
-# =====================================================
-
-@require_http_methods(["GET"])
-def api_schedules(request):
-    """API lấy thời khóa biểu"""
-    day = request.GET.get('day')
-    schedules = Schedule.objects.filter(is_active=True).select_related('subject', 'classroom')
-    
-    if day is not None:
-        schedules = schedules.filter(day_of_week=int(day))
-    
-    data = [{
-        'id': s.id,
-        'subject': s.subject.name,
-        'subject_code': s.subject.code,
-        'classroom': s.classroom.name,
-        'class_id': s.classroom.class_id,
-        'day_of_week': s.day_of_week,
-        'day_name': s.get_day_of_week_display(),
-        'start_period': s.start_period,
-        'end_period': s.end_period,
-        'time_range': s.get_time_range(),
-        'room': s.room,
-    } for s in schedules]
-    
-    return JsonResponse({'success': True, 'data': data})
-
-
-@require_http_methods(["GET"])
-def api_sessions_today(request):
-    """API lấy các buổi điểm danh hôm nay"""
-    today = timezone.now().date()
-    sessions = AttendanceSession.objects.filter(date=today).select_related('schedule__subject', 'schedule__classroom')
-    
-    data = [{
-        'id': s.id,
-        'subject': s.schedule.subject.name,
-        'classroom': s.schedule.classroom.name,
-        'date': str(s.date),
-        'status': s.status,
-        'status_display': s.get_status_display(),
-        'present_count': s.get_present_count(),
-        'total_students': s.get_total_students(),
-        'start_time': s.start_time.strftime('%H:%M:%S') if s.start_time else None,
-    } for s in sessions]
-    
-    return JsonResponse({'success': True, 'data': data})
-
-
-@require_http_methods(["GET"])
-def api_session_attendance(request, session_id):
-    """API lấy danh sách điểm danh của 1 buổi"""
-    try:
-        session = AttendanceSession.objects.get(id=session_id)
-        records = session.session_records.select_related('student')
-        
-        data = [{
-            'student_id': r.student.student_id,
-            'student_name': r.student.full_name,
-            'class_name': r.student.class_name,
-            'time_in': r.time_in.strftime('%H:%M:%S') if r.time_in else None,
-            'status': r.status,
-            'confidence': round(r.confidence * 100, 1) if r.confidence else 0,
-        } for r in records]
-        
-        return JsonResponse({
-            'success': True,
-            'session': {
-                'id': session.id,
-                'subject': session.schedule.subject.name,
-                'classroom': session.schedule.classroom.name,
-                'date': str(session.date),
-                'status': session.status,
-            },
-            'data': data
-        })
-    except AttendanceSession.DoesNotExist:
-        return JsonResponse({'success': False, 'error': 'Session not found'}, status=404)
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_record_session_attendance(request):
-    """API ghi nhận điểm danh cho 1 buổi học"""
-    try:
-        data = json.loads(request.body)
-        session_id = data.get('session_id')
-        student_name = data.get('student_name')
-        confidence = data.get('confidence', 0)
-        
-        if not session_id or not student_name:
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing session_id or student_name'
-            }, status=400)
-        
-        session = AttendanceSession.objects.get(id=session_id)
-        student = Student.objects.get(full_name=student_name)
-        
-        current_time = timezone.now()
-        
-        # Tạo hoặc cập nhật bản ghi điểm danh
-        record, created = AttendanceRecord.objects.update_or_create(
-            session=session,
-            student=student,
-            date=current_time.date(),
-            defaults={
-                'time_in': current_time.time(),
-                'status': 'present',
-                'confidence': confidence,
-            }
-        )
-        
-        return JsonResponse({
-            'success': True,
-            'message': f'{student.full_name} đã điểm danh thành công',
-            'data': {
-                'student_name': student.full_name,
-                'student_id': student.student_id,
-                'class_name': student.class_name,
-                'time_in': current_time.strftime('%H:%M:%S'),
-                'date': str(current_time.date()),
-                'session_id': session.id,
-                'subject': session.schedule.subject.name,
-                'created': created
-            }
-        })
-        
-    except AttendanceSession.DoesNotExist:
-        return JsonResponse({'success': False, 'error': 'Session not found'}, status=404)
-    except Student.DoesNotExist:
-        return JsonResponse({'success': False, 'error': 'Student not found'}, status=404)
-    except Exception as e:
-        return JsonResponse({'success': False, 'error': str(e)}, status=500)
-
-
-@csrf_exempt
-@require_http_methods(["POST"])
-def api_create_session(request):
-    """API tạo buổi điểm danh mới"""
-    try:
-        data = json.loads(request.body)
-        schedule_id = data.get('schedule_id')
-        date_str = data.get('date')  # Format: YYYY-MM-DD
-        
-        if not schedule_id:
-            return JsonResponse({
-                'success': False,
-                'error': 'Missing schedule_id'
-            }, status=400)
-        
-        schedule = Schedule.objects.get(id=schedule_id)
-        date = datetime.datetime.strptime(date_str, '%Y-%m-%d').date() if date_str else timezone.now().date()
-        
-        session, created = AttendanceSession.objects.get_or_create(
-            schedule=schedule,
-            date=date,
-            defaults={
-                'status': 'active',
-                'start_time': timezone.now()
-            }
-        )
-        
-        if not created:
+        if session.status in ('completed', 'cancelled'):
+            raise ValueError('Buổi học đã đóng. Vui lòng xem lại kết quả.')
+        if session.status == 'scheduled':
             session.status = 'active'
             session.start_time = timezone.now()
             session.save()
-        
-        return JsonResponse({
-            'success': True,
-            'message': 'Đã tạo buổi điểm danh',
-            'data': {
-                'session_id': session.id,
-                'subject': schedule.subject.name,
-                'classroom': schedule.classroom.name,
-                'date': str(date),
-                'created': created
-            }
-        })
-        
-    except Schedule.DoesNotExist:
-        return JsonResponse({'success': False, 'error': 'Schedule not found'}, status=404)
-    except Exception as e:
-        return JsonResponse({'success': False, 'error': str(e)}, status=500)
+    return session, created
+
+
+@require_http_methods(['POST'])
+def start_attendance_session(request, schedule_id):
+    schedule = get_object_or_404(Schedule, pk=schedule_id)
+    try:
+        session, _ = activate_session(schedule, timezone.localdate())
+    except ValueError:
+        session = AttendanceSession.objects.filter(schedule=schedule, date=timezone.localdate()).first()
+        return redirect('portal:attendance_session', session_id=session.pk) if session else redirect('portal:schedule')
+    return redirect('portal:attendance_session', session_id=session.pk)
+
+
+def attendance_session(request, session_id):
+    session = get_object_or_404(AttendanceSession.objects.select_related('schedule__subject', 'schedule__classroom'), pk=session_id)
+    return page(request, 'portal/attendance_session.html', 'schedule', session=session,
+                students_in_class=session.schedule.classroom.students.all(), attendance_records=session.session_records.select_related('student'),
+                attended_count=session.get_present_count(), total_students=session.get_total_students())
+
+
+@require_http_methods(['POST'])
+def end_attendance_session(request, session_id):
+    session = get_object_or_404(AttendanceSession, pk=session_id)
+    with transaction.atomic():
+        if session.status == 'active':
+            seen = session.session_records.values_list('student_id', flat=True)
+            for student in session.schedule.classroom.students.exclude(pk__in=seen):
+                AttendanceRecord.objects.get_or_create(session=session, student=student, date=session.date,
+                                                       defaults={'status': 'absent'})
+            session.status = 'completed'
+            session.end_time = timezone.now()
+            session.save()
+    return redirect('portal:attendance_session', session_id=session.pk)
+
+
+def gen_frames(camera):
+    try:
+        while True:
+            frame = camera.get_frame()
+            if frame is None:
+                break
+            yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+    finally:
+        camera.close()
+
+
+def stream(session=None):
+    camera = fr.VideoCamera(session_id=session.pk if session else None)
+    if not camera.video.isOpened():
+        camera.close()
+        return JsonResponse({'success': False, 'error': 'Không mở được camera trên máy chủ.'}, status=503)
+    return StreamingHttpResponse(gen_frames(camera), content_type='multipart/x-mixed-replace; boundary=frame')
+
+
+@require_http_methods(['GET'])
+def video_feed(request):
+    return stream()
+
+
+@require_http_methods(['GET'])
+def video_feed_session(request, session_id):
+    session = get_object_or_404(AttendanceSession, pk=session_id)
+    if session.status != 'active' or session.date != timezone.localdate():
+        return JsonResponse({'success': False, 'error': 'Buổi điểm danh không hoạt động.'}, status=409)
+    return stream(session)
+
+
+@api(['GET'])
+def api_stats(request):
+    return JsonResponse({'success': True, 'data': stats()})
+
+
+def record_json(record, created=False):
+    return {'student_id': record.student.student_id, 'student_name': record.student.full_name,
+            'class_name': record.student.class_name, 'time_in': record.time_in.strftime('%H:%M:%S') if record.time_in else None,
+            'time': record.time_in.strftime('%H:%M:%S') if record.time_in else None,
+            'date': str(record.date), 'status': record.status, 'confidence': record.confidence,
+            'session_id': record.session_id, 'created': created}
+
+
+@api(['POST'])
+def api_record_attendance(request):
+    data = payload(request)
+    student = Student.objects.get(student_id=data.get('student_id'))
+    record, created = record_student(student, data.get('confidence', 0), camera_id=str(data.get('camera_id', ''))[:50])
+    return JsonResponse({'success': True, 'message': 'Đã ghi nhận điểm danh.', 'data': record_json(record, created)})
+
+
+@api(['GET'])
+def api_students(request):
+    return JsonResponse({'success': True, 'data': [student_json(s) for s in Student.objects.all()]})
+
+
+@api(['GET'])
+def api_attendance_today(request):
+    records = AttendanceRecord.objects.filter(date=timezone.localdate()).select_related('student')
+    return JsonResponse({'success': True, 'date': str(timezone.localdate()), 'data': [record_json(r) for r in records]})
+
+
+@api(['POST'])
+def api_register_face(request):
+    data = payload(request)
+    # Existing IDs may receive more samples, but cannot be silently reassigned to a new person.
+    existing = Student.objects.filter(student_id=str(data.get('student_id', '')).strip()).first()
+    fields = student_fields(data, existing)
+    if existing and existing.full_name != fields['full_name']:
+        raise ValueError('Mã sinh viên đã thuộc một hồ sơ khác. Hãy chỉnh sửa hồ sơ trước.')
+    images = data.get('images')
+    if not isinstance(images, list) or not 1 <= len(images) <= 12:
+        raise ValueError('Vui lòng chọn từ 1 đến 12 ảnh.')
+    frames = [decode_image(image) for image in images]
+    samples = fr.extract_registration(frames)
+    with transaction.atomic():
+        student, created = Student.objects.update_or_create(student_id=fields['student_id'],
+                                                           defaults={**fields, 'is_registered': True})
+        count = fr.store_registration(student.student_id, samples)
+        sync_class(student)
+    return JsonResponse({'success': True, 'message': f'Đã lưu {count}/{len(images)} ảnh hợp lệ.',
+                         'data': {**student_json(student), 'faces_registered': count, 'created': created}})
+
+
+@api(['PUT'])
+def api_update_student(request, student_id):
+    data = payload(request)
+    student = Student.objects.get(pk=student_id)
+    fields = student_fields(data, student)
+    old_code = student.student_id
+    with fr._database_lock:
+        database = fr.load_database()
+        if fields['student_id'] != old_code:
+            old_dir = fr.person_directory(old_code)
+            new_dir = fr.person_directory(fields['student_id'])
+            if new_dir.exists() or fields['student_id'] in database:
+                raise ValueError('Mã mới đã có dữ liệu khuôn mặt.')
+            if old_dir.exists():
+                old_dir.rename(new_dir)
+            if old_code in database:
+                database[fields['student_id']] = database.pop(old_code)
+        # Legacy keys are migrated to student ID, preserving name changes and duplicate names.
+        if Student.objects.filter(full_name__iexact=student.full_name).count() == 1:
+            for legacy in [key for key in database if key.casefold() == student.full_name.casefold()
+                           and key != fields['student_id'] and student_for_identity(key) == student]:
+                database.setdefault(fields['student_id'], []).extend(database.pop(legacy))
+        fr.save_database(database)
+    for key, value in fields.items():
+        setattr(student, key, value)
+    student.save()
+    sync_class(student)
+    return JsonResponse({'success': True, 'message': 'Đã cập nhật hồ sơ.', 'data': student_json(student)})
+
+
+@api(['DELETE'])
+def api_delete_student(request, student_id):
+    student = Student.objects.get(pk=student_id)
+    keys = [student.student_id]
+    with fr._database_lock:
+        database = fr.load_database()
+        if student_for_identity(student.full_name) == student:
+            keys.append(student.full_name)
+            keys.extend(name for name in database if name.casefold() == student.full_name.casefold()
+                        and student_for_identity(name) == student and name not in keys)
+        for key in keys:
+            database.pop(key, None)
+            try:
+                folder = fr.person_directory(key)
+            except ValueError:
+                continue
+            if folder.exists():
+                shutil.rmtree(folder)
+        fr.save_database(database)
+    student.delete()
+    return JsonResponse({'success': True, 'message': 'Đã xóa hồ sơ và dữ liệu khuôn mặt liên quan.'})
+
+
+@api(['POST'])
+def api_recognize_face(request):
+    data = payload(request)
+    frame = decode_image(data.get('image'))
+    session = None
+    if data.get('session_id'):
+        session = AttendanceSession.objects.get(pk=data['session_id'])
+        if session.status != 'active' or session.date != timezone.localdate():
+            raise ValueError('Buổi điểm danh không hoạt động trong ngày hôm nay.')
+    results = fr.recognize_frame(frame)
+    recognized = []
+    for result in results:
+        result = dict(result)
+        identity = result['name']
+        student = student_for_identity(identity) if identity != 'Unknown' else None
+        result.update({'student_id': student.student_id if student else None,
+                       'name': student.full_name if student else 'Chưa xác định', 'recorded': False})
+        if student and data.get('record', True):
+            try:
+                record, created = record_student(student, result['confidence'], session=session, camera_id='BROWSER')
+                result.update({'recorded': True, 'created': created, 'time_in': record_json(record)['time_in']})
+            except ValueError as error:
+                result['reason'] = str(error)
+        recognized.append(result)
+    return JsonResponse({'success': True, 'data': {'faces_detected': len(results), 'recognized': recognized,
+                                                  'image_width': frame.shape[1], 'image_height': frame.shape[0],
+                                                  'scan_ms': fr.last_scan_ms, 'threshold': round(fr.THRESHOLD * 100, 2)}})
+
+
+@api(['GET'])
+def api_registered_faces(request):
+    database = fr.load_database()
+    data = []
+    for identity, embeddings in database.items():
+        student = student_for_identity(identity)
+        data.append({'identity': identity, 'name': student.full_name if student else identity,
+                     'student_id': student.student_id if student else None, 'embeddings_count': len(embeddings)})
+    return JsonResponse({'success': True, 'data': data})
+
+
+@api(['GET', 'POST'])
+def api_schedules(request):
+    if request.method == 'POST':
+        data = payload(request)
+        day, start, end = int(data.get('day_of_week', -1)), int(data.get('start_period', 0)), int(data.get('end_period', 0))
+        if not 0 <= day <= 6 or not 1 <= start <= end <= 10:
+            raise ValueError('Thứ hoặc khoảng tiết học không hợp lệ.')
+        subject_name = str(data.get('subject_name', '')).strip()
+        subject_code = str(data.get('subject_code', '')).strip()
+        class_id = str(data.get('class_id', '')).strip()
+        if not subject_name or not subject_code or not class_id or len(subject_name) > 100 or max(len(subject_code), len(class_id)) > 20:
+            raise ValueError('Vui lòng nhập mã môn, tên môn và mã lớp hợp lệ.')
+        room = str(data.get('room', '')).strip()
+        if len(room) > 50:
+            raise ValueError('Tên phòng tối đa 50 ký tự.')
+        with transaction.atomic():
+            subject, _ = Subject.objects.get_or_create(code=subject_code, defaults={'name': subject_name})
+            classroom, _ = ClassRoom.objects.get_or_create(class_id=class_id, defaults={'name': class_id})
+            if Schedule.objects.filter(classroom=classroom, day_of_week=day, is_active=True,
+                                       start_period__lte=end, end_period__gte=start).exists():
+                raise ValueError('Lớp này đã có lịch học trùng tiết.')
+            schedule = Schedule.objects.create(subject=subject, classroom=classroom, day_of_week=day,
+                                               start_period=start, end_period=end, room=room)
+            classroom.students.add(*Student.objects.filter(class_name=class_id))
+        return JsonResponse({'success': True, 'message': 'Đã thêm lịch học.', 'data': {'id': schedule.pk}}, status=201)
+    schedules = Schedule.objects.filter(is_active=True).select_related('subject', 'classroom')
+    if request.GET.get('day') is not None:
+        day = int(request.GET['day'])
+        if not 0 <= day <= 6:
+            raise ValueError('Thứ không hợp lệ.')
+        schedules = schedules.filter(day_of_week=day)
+    return JsonResponse({'success': True, 'data': [
+        {'id': s.pk, 'subject': s.subject.name, 'subject_code': s.subject.code,
+         'classroom': s.classroom.name, 'class_id': s.classroom.class_id, 'day_of_week': s.day_of_week,
+         'day_name': s.get_day_of_week_display(), 'start_period': s.start_period, 'end_period': s.end_period,
+         'time_range': s.get_time_range(), 'room': s.room} for s in schedules]})
+
+
+@api(['GET'])
+def api_sessions_today(request):
+    sessions = AttendanceSession.objects.filter(date=timezone.localdate()).select_related('schedule__subject', 'schedule__classroom')
+    return JsonResponse({'success': True, 'data': [
+        {'id': s.pk, 'subject': s.schedule.subject.name, 'classroom': s.schedule.classroom.name,
+         'date': str(s.date), 'status': s.status, 'status_display': s.get_status_display(),
+         'present_count': s.get_present_count(), 'total_students': s.get_total_students(),
+         'start_time': timezone.localtime(s.start_time).strftime('%H:%M:%S') if s.start_time else None} for s in sessions]})
+
+
+@api(['GET'])
+def api_session_attendance(request, session_id):
+    session = AttendanceSession.objects.get(pk=session_id)
+    return JsonResponse({'success': True, 'session': {'id': session.pk, 'status': session.status,
+                         'total_students': session.get_total_students(), 'present_count': session.get_present_count(),
+                         'date': str(session.date), 'subject': session.schedule.subject.name, 'classroom': session.schedule.classroom.name},
+                         'data': [record_json(r) for r in session.session_records.select_related('student')]})
+
+
+@api(['POST'])
+def api_record_session_attendance(request):
+    data = payload(request)
+    session = AttendanceSession.objects.get(pk=data.get('session_id'))
+    student = (Student.objects.get(student_id=data['student_id']) if data.get('student_id')
+               else student_for_identity(data.get('student_name', '')))
+    if not student:
+        raise Student.DoesNotExist()
+    record, created = record_student(student, data.get('confidence', 0), session=session)
+    return JsonResponse({'success': True, 'data': record_json(record, created), 'message': 'Đã điểm danh buổi học.'})
+
+
+@api(['POST'])
+def api_create_session(request):
+    data = payload(request)
+    schedule = Schedule.objects.get(pk=data.get('schedule_id'))
+    date = datetime.date.fromisoformat(data['date']) if data.get('date') else timezone.localdate()
+    session, created = activate_session(schedule, date)
+    return JsonResponse({'success': True, 'data': {'session_id': session.pk, 'created': created,
+                         'subject': schedule.subject.name, 'classroom': schedule.classroom.name, 'date': str(date)}})
+
+
+@api(['GET'])
+def api_system(request):
+    import onnxruntime as ort
+    providers = []
+    if fr._face_app is not None:
+        providers = fr._face_app.models['recognition'].session.get_providers()
+    return JsonResponse({'success': True, 'data': {
+        'opencv': cv2.__version__, 'engine': 'InsightFace', 'model': fr.MODEL_NAME,
+        'threshold': round(fr.THRESHOLD * 100, 2), 'model_loaded': fr._face_app is not None,
+        'available_providers': ort.get_available_providers(), 'active_providers': providers,
+        'database': settings.DATABASES['default']['ENGINE'].split('.')[-1], 'scan_ms': fr.last_scan_ms}})
+
+
+@api(['GET'])
+def export_attendance(request):
+    records = AttendanceRecord.objects.select_related('student', 'session__schedule__subject')
+    if request.GET.get('session'):
+        records = records.filter(session_id=int(request.GET['session']))
+    else:
+        date = datetime.date.fromisoformat(request.GET.get('date', str(timezone.localdate())))
+        records = records.filter(date=date)
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(['Mã sinh viên', 'Họ tên', 'Lớp', 'Ngày', 'Giờ vào', 'Trạng thái', 'Điểm tương đồng (%)', 'Buổi'])
+    def cell(value):
+        value = str(value)
+        return "'" + value if value.startswith(('=', '+', '-', '@')) else value
+    for record in records:
+        writer.writerow([cell(record.student.student_id), cell(record.student.full_name), cell(record.student.class_name),
+                         record.date, record.time_in or '', record.get_status_display(), record.confidence,
+                         record.session_id or 'Tự do'])
+    response = HttpResponse('\ufeff' + buffer.getvalue(), content_type='text/csv; charset=utf-8')
+    response['Content-Disposition'] = 'attachment; filename="attendance.csv"'
+    return response
 

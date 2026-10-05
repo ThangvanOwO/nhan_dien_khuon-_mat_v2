@@ -1,24 +1,44 @@
-# Django Attendance System - Requirements
-# ========================================
-
-# Django Framework
-Django>=4.2,<5.0
-
-# Database - SQLite (default) hoặc MySQL
-# mysqlclient>=2.2.0
-
-# Image Processing
-Pillow>=10.0.0
-
-# Development tools
-python-dotenv>=1.0.0
-
-# OpenCV & InsightFace (Face Recognition)
-opencv-python>=4.8.0
-numpy>=1.24.0
-insightface>=0.7.3
-onnxruntime-gpu>=1.16.0  # Dùng GPU - hoặc onnxruntime nếu không có GPU
-
-# Optional - Production
-# gunicorn>=21.0.0
-# whitenoise>=6.5.0
+# Tested lock: Windows x64 / Python 3.12 / NVIDIA GPU.
+# Install using setup_windows.ps1, or pip install --no-deps -r requirements.txt.
+# Dependencies are explicit to avoid InsightFace pulling CPU onnxruntime
+# over the GPU distribution. Do not install both runtimes in the same venv.
+asgiref==3.12.1
+certifi==2026.7.22
+charset-normalizer==3.5.2
+colorama==0.4.6
+coloredlogs==15.0.1
+Django==4.2.30
+flatbuffers==25.12.19
+humanfriendly==10.0
+idna==3.20
+ImageIO==2.38.0
+insightface==2.1
+lazy-loader==0.6
+ml_dtypes==0.6.0
+mpmath==1.3.0
+networkx==3.7
+numpy==2.5.3
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cuda-nvrtc-cu12==12.9.86
+nvidia-cuda-runtime-cu12==12.4.99
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cufft-cu12==11.4.1.4
+nvidia-nvjitlink-cu12==12.9.86
+onnx==1.23.1
+onnxruntime-gpu==1.22.0
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+protobuf==7.36.2
+pyreadline3==3.5.6
+python-dotenv==1.2.4
+requests==2.34.2
+scikit-image==0.26.0
+scipy==1.18.1
+sqlparse==0.6.0
+sympy==1.14.0
+tifffile==2026.9.20
+tqdm==4.70.1
+typing_extensions==4.16.0
+tzdata==2026.5
+urllib3==2.8.0

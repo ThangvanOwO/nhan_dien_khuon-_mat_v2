@@ -1,5 +1,13 @@
 from django.contrib import admin
-from .models import Student, AttendanceRecord, Camera, SystemStats
+from .models import Student, AttendanceRecord, Camera, SystemStats, Subject, ClassRoom, Schedule, AttendanceSession
+
+admin.site.site_header = 'VISTA · Quản trị điểm danh'
+admin.site.site_title = 'VISTA Admin'
+admin.site.index_title = 'Dữ liệu hệ thống'
+admin.site.register(Subject)
+admin.site.register(ClassRoom)
+admin.site.register(Schedule)
+admin.site.register(AttendanceSession)
 
 
 @admin.register(Student)

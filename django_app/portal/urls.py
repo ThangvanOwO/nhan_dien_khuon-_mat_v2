@@ -6,6 +6,7 @@ app_name = 'portal'
 urlpatterns = [
     # Main pages
     path('', views.home, name='home'),
+    path('technology/', views.technology, name='technology'),
     path('admin-dashboard/', views.admin_dashboard, name='admin_dashboard'),
     path('register/', views.register_face, name='register'),
     
@@ -22,6 +23,8 @@ urlpatterns = [
     
     # API Endpoints
     path('api/stats/', views.api_stats, name='api_stats'),
+    path('api/system/', views.api_system, name='api_system'),
+    path('api/attendance/export/', views.export_attendance, name='export_attendance'),
     path('api/record-attendance/', views.api_record_attendance, name='api_record_attendance'),
     path('api/students/', views.api_students, name='api_students'),
     path('api/attendance/today/', views.api_attendance_today, name='api_attendance_today'),

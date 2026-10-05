@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local virtual environments
+venv/
+.venv/
+
+# Local configuration, databases and runtime files
+.env
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.log
+django_app/media/
+django_app/staticfiles/
+django_app/backups/
+
+# Biometric data and private test photographs
+/face_database.pkl
+/my_faces/
+/viet_temp/
+/test.jpeg
+/test2.jpg
+/test_result.jpg
+
+# Local reports and screenshots may contain personal information
+/bao_cao/
+/django_app/docs/

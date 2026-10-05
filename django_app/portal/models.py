@@ -141,7 +141,7 @@ class AttendanceSession(models.Model):
         return f"#{self.id} - {self.schedule.subject.name} - {self.schedule.classroom.name} - {self.date}"
     
     def get_present_count(self):
-        return self.session_records.filter(status='present').count()
+        return self.session_records.filter(status__in=['present', 'late']).values('student_id').distinct().count()
     
     def get_total_students(self):
         return self.schedule.classroom.students.count()
@@ -170,6 +170,12 @@ class AttendanceRecord(models.Model):
         verbose_name = "Bản ghi điểm danh"
         verbose_name_plural = "Lịch sử điểm danh"
         ordering = ['-date', '-time_in']
+        constraints = [
+            models.UniqueConstraint(fields=['student', 'date'], condition=models.Q(session__isnull=True),
+                                    name='unique_daily_attendance'),
+            models.UniqueConstraint(fields=['session', 'student'], condition=models.Q(session__isnull=False),
+                                    name='unique_session_attendance'),
+        ]
 
     def __str__(self):
         session_info = f" - Buổi #{self.session.id}" if self.session else ""

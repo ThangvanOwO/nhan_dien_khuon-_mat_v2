@@ -1,105 +1,61 @@
 {% load static %}
 <!DOCTYPE html>
-<html class="dark" lang="vi">
+<html lang="vi">
 <head>
-    <meta charset="utf-8" />
-    <meta content="width=device-width, initial-scale=1.0" name="viewport" />
-    <title>{% block title %}OpenCV AI Portal{% endblock %}</title>
-    
-    <!-- Tailwind CSS -->
-    <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
-    
-    <!-- Google Fonts -->
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap" rel="stylesheet" />
-    <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet" />
-    
-    <!-- Tailwind Config -->
-    <script>
-        tailwind.config = {
-            darkMode: "class",
-            theme: {
-                extend: {
-                    colors: {
-                        "primary": "#2b6cee",
-                        "primary-glow": "#4d8aff",
-                        "background-light": "#f6f6f8",
-                        "background-dark": "#0b0e14",
-                        "glass-border": "rgba(255, 255, 255, 0.1)",
-                        "glass-surface": "rgba(255, 255, 255, 0.03)",
-                        "success": "#22c55e",
-                        "warning": "#f59e0b",
-                    },
-                    fontFamily: {
-                        "display": ["Space Grotesk", "sans-serif"]
-                    },
-                    borderRadius: {
-                        "DEFAULT": "0.5rem",
-                        "lg": "1rem",
-                        "xl": "1.5rem",
-                        "2xl": "2rem",
-                        "full": "9999px"
-                    },
-                    animation: {
-                        'blob': 'blob 10s infinite',
-                        'pulse-slow': 'pulse 3s ease-in-out infinite',
-                        'float': 'float 6s ease-in-out infinite',
-                        'scan-line': 'scanLine 2s linear infinite',
-                        'shimmer': 'shimmer 2s linear infinite',
-                        'glow': 'glow 2s ease-in-out infinite alternate',
-                    },
-                    keyframes: {
-                        blob: {
-                            '0%': { transform: 'translate(0px, 0px) scale(1)' },
-                            '33%': { transform: 'translate(30px, -50px) scale(1.1)' },
-                            '66%': { transform: 'translate(-20px, 20px) scale(0.9)' },
-                            '100%': { transform: 'translate(0px, 0px) scale(1)' },
-                        },
-                        float: {
-                            '0%, 100%': { transform: 'translateY(0)' },
-                            '50%': { transform: 'translateY(-10px)' },
-                        },
-                        scanLine: {
-                            '0%': { top: '0%' },
-                            '100%': { top: '100%' },
-                        },
-                        shimmer: {
-                            '0%': { backgroundPosition: '-200% 0' },
-                            '100%': { backgroundPosition: '200% 0' },
-                        },
-                        glow: {
-                            '0%': { boxShadow: '0 0 5px rgba(43, 108, 238, 0.5), 0 0 20px rgba(43, 108, 238, 0.3)' },
-                            '100%': { boxShadow: '0 0 20px rgba(43, 108, 238, 0.8), 0 0 40px rgba(43, 108, 238, 0.5)' },
-                        },
-                    }
-                },
-            },
-        }
-    </script>
-    
-    <!-- Custom Styles -->
-    <link rel="stylesheet" href="{% static 'css/styles.css' %}">
-    
-    {% block extra_css %}{% endblock %}
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1b231e">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>{% block title %}VISTA · Điểm danh OpenCV{% endblock %}</title>
+  <link rel="icon" href="{% static 'favicon.svg' %}" type="image/svg+xml">
+  <link rel="stylesheet" href="{% static 'css/styles.css' %}?v=4">
 </head>
-
-<body class="bg-background-dark text-white font-display relative min-h-screen flex flex-col selection:bg-primary selection:text-white overflow-x-hidden">
-    
-    {% block content %}{% endblock %}
-    
-    <!-- Toast Notification -->
-    <div id="toast" class="fixed bottom-8 left-1/2 -translate-x-1/2 z-[110] transform translate-y-20 opacity-0 transition-all duration-300">
-        <div class="glass-card rounded-xl px-6 py-4 flex items-center gap-3 shadow-2xl">
-            <span id="toastIcon" class="material-symbols-outlined text-green-400">check_circle</span>
-            <span id="toastMessage" class="font-medium">Success!</span>
-        </div>
-    </div>
-    
-    <!-- Background Grid Texture Overlay -->
-    <div class="absolute inset-0 pointer-events-none z-0 opacity-[0.03]" style="background-image: linear-gradient(rgba(255,255,255,0.5) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.5) 1px, transparent 1px); background-size: 40px 40px;"></div>
-    
-    <!-- Base JavaScript -->
-    <script src="{% static 'js/main.js' %}"></script>
-    
-    {% block extra_js %}{% endblock %}
-</body>
-</html>
+<body data-page="{% block page_id %}home{% endblock %}">
+<a class="skip-link" href="#main">Đến nội dung chính</a>
+<svg class="svg-library" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+<symbol id="i-home" viewBox="0 0 24 24"><path d="M3 10 12 3l9 7v10H3Z"/><path d="M9 20v-7h6v7"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M7 3v4m10-4v4M3 11h18m-13 5h2m4 0h2"/></symbol>
+<symbol id="i-face" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m8 0h5v-5"/><path d="M8 9v2m8-2v2m-8 4q4 4 8 0"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m2-17a3 3 0 0 1 0 6m1 5a5 5 0 0 1 3 5"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-camera" viewBox="0 0 24 24"><path d="M3 7h5l2-3h4l2 3h5v14H3Z"/><circle cx="12" cy="13" r="4"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="m15 4 5 5-10 10-6 1 1-6Z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 3h6m-10 3 1 15h12l1-15M10 10v7m4-7v7"/></symbol>
+<symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+<symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h16"/></symbol>
+<symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 10v7m0-11v1"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 6v6l4 2"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></symbol>
+</svg>
+<aside class="sidebar" id="sidebar">
+  <a class="brand" href="{% url 'portal:home' %}"><span class="brand-mark"><svg class="icon"><use href="#i-face"/></svg></span><span>VISTA<span class="brand-sub">OPENCV ATTENDANCE</span></span></a>
+  <div class="workspace-label">KHÔNG GIAN LÀM VIỆC</div>
+  <nav class="main-nav" aria-label="Điều hướng chính">
+    <a href="{% url 'portal:home' %}" {% if active_nav == 'home' %}class="active" aria-current="page"{% endif %}><svg class="icon"><use href="#i-home"/></svg>Tổng quan</a>
+    <a href="{% url 'portal:schedule' %}" {% if active_nav == 'schedule' %}class="active" aria-current="page"{% endif %}><svg class="icon"><use href="#i-calendar"/></svg>Lịch học & buổi học</a>
+    <a href="{% url 'portal:scan_camera' %}" {% if active_nav == 'scan' %}class="active" aria-current="page"{% endif %}><svg class="icon"><use href="#i-face"/></svg>Điểm danh trực tiếp<span class="nav-dot"></span></a>
+    <a href="{% url 'portal:register' %}" {% if active_nav == 'register' %}class="active" aria-current="page"{% endif %}><svg class="icon"><use href="#i-plus"/></svg>Đăng ký khuôn mặt</a>
+    <a href="{% url 'portal:admin_dashboard' %}" {% if active_nav == 'admin' %}class="active" aria-current="page"{% endif %}><svg class="icon"><use href="#i-users"/></svg>Quản lý sinh viên</a>
+  </nav>
+  <div class="sidebar-bottom">
+    <div class="side-note"><span class="eyebrow">MỖI KHUÔN MẶT.</span><strong>Một kết nối.</strong><p>Điểm danh nhanh hơn.<br>Lớp học gần nhau hơn.</p><svg class="side-aperture" viewBox="0 0 100 100" aria-hidden="true"><circle cx="50" cy="50" r="36"/><path d="M50 14 81 68 19 68Z"/><circle cx="50" cy="50" r="12"/></svg></div>
+    <a class="side-link" href="{% url 'portal:technology' %}"><svg class="icon"><use href="#i-info"/></svg>Về hệ thống <span>↗</span></a>
+    <a class="profile" href="/admin/"><span class="avatar small">VT</span><span><strong>VISTA Workspace</strong><small>Quản trị dữ liệu Django</small></span><span>↗</span></a>
+  </div>
+</aside>
+<div class="app">
+  <header class="topbar"><div class="topbar-left"><button class="icon-button mobile-menu" id="menuToggle" aria-label="Mở menu" aria-expanded="false"><svg class="icon"><use href="#i-menu"/></svg></button><span class="breadcrumb">Workspace <span>/</span> {% block breadcrumb %}Tổng quan{% endblock %}</span></div><div class="topbar-right"><span id="currentTime" class="clock"></span><span class="status-pill" id="serverStatus"><i></i>Máy chủ trực tuyến</span><a class="avatar small" href="/admin/" aria-label="Django Admin">VT</a></div></header>
+  <main id="main" class="main">{% block content %}{% endblock %}</main>
+  <footer class="footer"><span>VISTA / Nhận diện để kết nối.</span><span>OpenCV Attendance System · {% now "Y" %}</span></footer>
+</div>
+<div id="toast" role="status" aria-live="polite" hidden></div>
+<dialog id="confirmDialog"><form method="dialog"><div class="dialog-heading"><span class="eyebrow">XÁC NHẬN THAO TÁC</span><button class="icon-button" value="cancel" aria-label="Đóng"><svg class="icon"><use href="#i-close"/></svg></button></div><h2 id="confirmTitle">Xóa hồ sơ?</h2><p id="confirmMessage"></p><div class="dialog-actions"><button class="button secondary" value="cancel">Hủy</button><button class="button danger" value="confirm">Xóa hồ sơ</button></div></form></dialog>
+<script src="{% static 'js/camera-policy.js' %}?v=1"></script>
+<script src="{% static 'js/face-overlay.js' %}?v=1"></script>
+<script src="{% static 'js/main.js' %}?v=5"></script>
+{% block extra_js %}{% endblock %}
+</body></html>
